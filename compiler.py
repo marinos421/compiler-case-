@@ -270,12 +270,14 @@ class Entity:
     kind: str
     mode: str = ""
     scope_level: int = 0
+    offset: int = 0
 
 
 class Scope:
     def __init__(self, level):
         self.level = level
         self.entities = []
+        self.next_offset = -12
 
     def add_entity(self, entity: Entity):
         for e in self.entities:
@@ -309,13 +311,32 @@ class SymbolTable:
 
     def add_variable(self, name):
         scope = self.current_scope()
-        scope.add_entity(Entity(name=name, kind="variable", scope_level=scope.level))
+        offset = scope.next_offset
+        scope.add_entity(
+            Entity(
+                name=name,
+                kind="variable",
+                scope_level=scope.level,
+                offset=offset
+            )
+        )
+        scope.next_offset -= 4
+
 
     def add_parameter(self, name, mode):
         scope = self.current_scope()
+        offset = scope.next_offset
         scope.add_entity(
-            Entity(name=name, kind="parameter", mode=mode, scope_level=scope.level)
+            Entity(
+                name=name,
+                kind="parameter",
+                mode=mode,
+                scope_level=scope.level,
+                offset=offset
+            )
         )
+        scope.next_offset -= 4
+
 
     def add_function(self, name):
         scope = self.current_scope()
@@ -323,11 +344,21 @@ class SymbolTable:
 
     def add_temp(self, name):
         scope = self.current_scope()
-        # για να μην πετάει duplicate αν ξαναγίνει κατά λάθος
+
         for e in scope.entities:
             if e.name == name:
                 return
-        scope.add_entity(Entity(name=name, kind="temp", scope_level=scope.level))
+
+        offset = scope.next_offset
+        scope.add_entity(
+            Entity(
+                name=name,
+                kind="temp",
+                scope_level=scope.level,
+                offset=offset
+            )
+        )
+        scope.next_offset -= 4
 
     def lookup(self, name):
         for scope in reversed(self.scopes):
@@ -338,15 +369,23 @@ class SymbolTable:
 
     def format_scope(self, scope: Scope):
         lines = [f"Scope level {scope.level}:"]
+
         if not scope.entities:
             lines.append("  (empty)")
             return "\n".join(lines)
 
         for e in scope.entities:
             if e.kind == "parameter":
-                lines.append(f"  {e.name} | {e.kind} | {e.mode}")
+                lines.append(
+                    f"  {e.name} | {e.kind} | {e.mode} | offset: {e.offset}"
+                )
+            elif e.kind in ("variable", "temp"):
+                lines.append(
+                    f"  {e.name} | {e.kind} | offset: {e.offset}"
+                )
             else:
                 lines.append(f"  {e.name} | {e.kind}")
+
         return "\n".join(lines)
 
     def write_symb_file(self, filename):
@@ -354,6 +393,283 @@ class SymbolTable:
             for scope in self.completed_scopes:
                 f.write(self.format_scope(scope))
                 f.write("\n\n")
+
+class FinalCode:
+    def __init__(self, intermediate_code: IntermediateCode, symbol_table: SymbolTable):
+        self.ic = intermediate_code
+        self.symtab = symbol_table
+        self.asm = []
+
+        # Κρατάμε προσωρινά τις παραμέτρους που εμφανίζονται πριν από ένα call.
+        self.pending_params = []
+        self.pending_ret = None
+
+        # Εδώ κρατάμε σε ποιο scope ανήκει κάθε block/function.
+        self.block_scopes = {}
+        self.current_scope = None
+
+    def is_integer(self, value):
+        value = str(value)
+        return value.isdigit() or (value.startswith("-") and value[1:].isdigit())
+    
+    def prepare_block_scopes(self):
+        """
+        Συνδέει κάθε begin_block με ένα scope από το completed_scopes.
+
+        Επειδή τα scopes ολοκληρώνονται με σειρά:
+        - πρώτα οι functions
+        - μετά το main program
+
+        και τα begin_block στον ενδιάμεσο κώδικα βγαίνουν με την ίδια σειρά,
+        μπορούμε να τα αντιστοιχίσουμε απλά ένα προς ένα.
+        """
+        block_names = []
+
+        for q in self.ic.quads:
+            if q.op == "begin_block":
+                block_names.append(q.x)
+
+        for name, scope in zip(block_names, self.symtab.completed_scopes):
+            self.block_scopes[name] = scope
+            
+    def get_main_block_name(self):
+        begin_blocks = [q.x for q in self.ic.quads if q.op == "begin_block"]
+        if not begin_blocks:
+            return None
+        return begin_blocks[-1]
+
+    def find_entity(self, name):
+        """
+        Ψάχνει πρώτα στο τρέχον scope και μετά σε όλα τα υπόλοιπα.
+        Για την απλή έκδοση αυτό αρκεί.
+        """
+        if self.current_scope is not None:
+            for entity in self.current_scope.entities:
+                if entity.name == name:
+                    return entity
+
+        for scope in reversed(self.symtab.completed_scopes):
+            for entity in scope.entities:
+                if entity.name == name:
+                    return entity
+
+        return None
+
+    def loadvr(self, value, register):
+        value = str(value)
+
+        if self.is_integer(value):
+            self.asm.append(f"    li {register}, {value}")
+            return
+
+        entity = self.find_entity(value)
+
+        if entity is None:
+            self.asm.append(f"    # ERROR: unknown variable {value}")
+            return
+
+        if entity.kind == "parameter" and entity.mode == "REF":
+            self.asm.append(f"    lw t6, {entity.offset}(sp)")
+            self.asm.append(f"    lw {register}, 0(t6)")
+        else:
+            self.asm.append(f"    lw {register}, {entity.offset}(sp)")
+        
+    def load_address(self, variable, register):
+        """
+        Φορτώνει τη διεύθυνση μίας μεταβλητής σε register.
+        Χρειάζεται για inout / REF παραμέτρους.
+        """
+        variable = str(variable)
+        entity = self.find_entity(variable)
+
+        if entity is None:
+            self.asm.append(f"    # ERROR: unknown variable {variable}")
+            return
+
+        if entity.kind == "parameter" and entity.mode == "REF":
+            self.asm.append(f"    lw {register}, {entity.offset}(sp)")
+        else:
+            self.asm.append(f"    addi {register}, sp, {entity.offset}")
+
+    def storerv(self, register, variable):
+        variable = str(variable)
+        entity = self.find_entity(variable)
+
+        if entity is None:
+            self.asm.append(f"    # ERROR: unknown variable {variable}")
+            return
+
+        if entity.kind == "parameter" and entity.mode == "REF":
+            self.asm.append(f"    lw t6, {entity.offset}(sp)")
+            self.asm.append(f"    sw {register}, 0(t6)")
+        else:
+            self.asm.append(f"    sw {register}, {entity.offset}(sp)")
+
+    def generate(self):
+        self.prepare_block_scopes()
+
+        self.asm.append(".data")
+        self.asm.append('str_nl: .asciz "\\n"')
+        self.asm.append("")
+        self.asm.append(".text")
+        self.asm.append(".globl main")
+        self.asm.append("main:")
+
+        # Πηδάμε στην αρχή του main program, γιατί οι functions εμφανίζονται πρώτες.
+        main_name = None
+        for q in self.ic.quads:
+            if q.op == "halt":
+                # το main begin_block είναι το τελευταίο begin_block πριν το halt
+                break
+
+        begin_blocks = [q.x for q in self.ic.quads if q.op == "begin_block"]
+        if begin_blocks:
+            main_name = begin_blocks[-1]
+
+        if main_name is not None:
+            self.asm.append(f"    j L_block_{main_name}")
+        self.asm.append("")
+
+        for quad in self.ic.quads:
+            self.translate_quad(quad)
+
+    def translate_quad(self, q: Quad):
+        self.asm.append(f"L_{q.label}:")
+        op = q.op
+
+        if op == "begin_block":
+            self.current_scope = self.block_scopes.get(q.x)
+            self.asm.append(f"L_block_{q.x}:")
+            self.asm.append(f"    # begin_block {q.x}")
+            self.store_formal_parameters()
+
+        elif op == "end_block":
+            self.asm.append(f"    # end_block {q.x}")
+            if q.x != self.get_main_block_name():
+                self.asm.append("    jr ra")
+
+        elif op == ":=":
+            self.loadvr(q.x, "t0")
+            self.storerv("t0", q.z)
+
+        elif op in ("+", "-", "*", "/"):
+            self.loadvr(q.x, "t1")
+            self.loadvr(q.y, "t2")
+
+            if op == "+":
+                self.asm.append("    add t0, t1, t2")
+            elif op == "-":
+                self.asm.append("    sub t0, t1, t2")
+            elif op == "*":
+                self.asm.append("    mul t0, t1, t2")
+            elif op == "/":
+                self.asm.append("    div t0, t1, t2")
+
+            self.storerv("t0", q.z)
+
+        elif op == "jump":
+            self.asm.append(f"    j L_{q.z}")
+
+        elif op in ("=", "<>", "<", ">", "<=", ">="):
+            self.loadvr(q.x, "t1")
+            self.loadvr(q.y, "t2")
+
+            branch_map = {
+                "=": "beq",
+                "<>": "bne",
+                "<": "blt",
+                ">": "bgt",
+                "<=": "ble",
+                ">=": "bge",
+            }
+
+            branch = branch_map[op]
+            self.asm.append(f"    {branch} t1, t2, L_{q.z}")
+
+        elif op == "out":
+            self.loadvr(q.x, "a0")
+            self.asm.append("    li a7, 1")
+            self.asm.append("    ecall")
+            self.asm.append("    la a0, str_nl")
+            self.asm.append("    li a7, 4")
+            self.asm.append("    ecall")
+
+        elif op == "inp":
+            self.asm.append("    li a7, 5")
+            self.asm.append("    ecall")
+            self.storerv("a0", q.x)
+
+        elif op == "halt":
+            self.asm.append("    addi sp, sp, 256")
+            self.asm.append("    li a0, 0")
+            self.asm.append("    li a7, 93")
+            self.asm.append("    ecall")
+
+        elif op == "par":
+            if q.y == "RET":
+                self.pending_ret = q.x
+            else:
+                self.pending_params.append((q.x, q.y))
+
+        elif op == "call":
+            func_name = q.x
+
+            # 1. Φορτώνουμε τις actual παραμέτρους ΠΡΙΝ αλλάξουμε stack frame.
+            for index, (param_value, param_mode) in enumerate(self.pending_params):
+                target_register = f"a{index + 1}"
+
+                if param_mode == "REF":
+                    self.load_address(param_value, target_register)
+                else:
+                    self.loadvr(param_value, target_register)
+
+            # 2. Φτιάχνουμε νέο frame για την function.
+            self.asm.append("    addi sp, sp, -256")
+            self.asm.append("    sw ra, 0(sp)")
+
+            # 3. Κλήση function.
+            self.asm.append(f"    jal L_block_{func_name}")
+
+            # 4. Επιστροφή στο προηγούμενο frame.
+            self.asm.append("    lw ra, 0(sp)")
+            self.asm.append("    addi sp, sp, 256")
+
+            # 5. Αν υπάρχει return temp, αποθηκεύουμε το a0 στο caller frame.
+            if self.pending_ret is not None:
+                self.storerv("a0", self.pending_ret)
+
+            self.pending_params = []
+            self.pending_ret = None
+
+        elif op == "retv":
+            self.loadvr(q.x, "a0")
+            self.asm.append("    jr ra")
+
+        else:
+            self.asm.append(f"    # Unsupported quad: {q.op}, {q.x}, {q.y}, {q.z}")
+
+        self.asm.append("")
+        
+    def store_formal_parameters(self):
+        """
+        Τα actual params έχουν έρθει στους a1, a2, ...
+        Για CV κρατάμε τιμή.
+        Για REF κρατάμε διεύθυνση.
+        """
+        if self.current_scope is None:
+            return
+
+        param_index = 1
+
+        for entity in self.current_scope.entities:
+            if entity.kind == "parameter":
+                self.asm.append(f"    sw a{param_index}, {entity.offset}(sp)")
+                param_index += 1
+
+    def write_asm_file(self, filename):
+        with open(filename, "w", encoding="utf-8") as f:
+            for line in self.asm:
+                f.write(line + "\n")
                 
 class Parser:
     def __init__(self, lexer: Lexer):
@@ -587,7 +903,6 @@ class Parser:
             self.statements()
 
             t = self.ic.makelist(self.ic.genquad("jump", "_", "_", "_"))
-            self.symtab.add_temp(t)
             exit_list = self.ic.mergelist(exit_list, t)
 
             self.ic.backpatch(false_list, self.ic.nextquad())
@@ -618,28 +933,7 @@ class Parser:
         self._eat("DEFAULT")
         self._eat("COLON")
         self.statements()
-
-    def incase_stat(self):
-        self._eat("INCASE")
-
-        t = self.ic.newtemp()
-        first_quad = self.ic.nextquad()
-        self.ic.genquad(":=", "0", "_", t)
-
-        while self.lookahead.type == "WHEN":
-            self._eat("WHEN")
-
-            true_list, false_list = self.condition()
-            self._eat("COLON")
-
-            self.ic.backpatch(true_list, self.ic.nextquad())
-            self.statements()
-            self.ic.genquad(":=", "1", "_", t)
-
-            self.ic.backpatch(false_list, self.ic.nextquad())
-
-        self.ic.genquad("=", t, "1", first_quad)
-
+        
     def forcase_stat(self):
         self._eat("FORCASE")
 
@@ -658,8 +952,12 @@ class Parser:
         self.ic.genquad(":=", "1", "_", counter_name)
 
         check_quad = self.ic.nextquad()
-        true_list = self.ic.makelist(self.ic.genquad("<=", counter_name, limit_value, "_"))
-        false_list = self.ic.makelist(self.ic.genquad("jump", "_", "_", "_"))
+        true_list = self.ic.makelist(
+            self.ic.genquad("<=", counter_name, limit_value, "_")
+        )
+        false_list = self.ic.makelist(
+            self.ic.genquad("jump", "_", "_", "_")
+        )
 
         self.ic.backpatch(true_list, self.ic.nextquad())
 
@@ -680,6 +978,29 @@ class Parser:
         self.ic.genquad("jump", "_", "_", check_quad)
 
         self.ic.backpatch(false_list, self.ic.nextquad())
+
+    def incase_stat(self):
+        self._eat("INCASE")
+
+        t = self.ic.newtemp()
+        self.symtab.add_temp(t)
+
+        first_quad = self.ic.nextquad()
+        self.ic.genquad(":=", "0", "_", t)
+
+        while self.lookahead.type == "WHEN":
+            self._eat("WHEN")
+
+            true_list, false_list = self.condition()
+            self._eat("COLON")
+
+            self.ic.backpatch(true_list, self.ic.nextquad())
+            self.statements()
+            self.ic.genquad(":=", "1", "_", t)
+
+            self.ic.backpatch(false_list, self.ic.nextquad())
+
+        self.ic.genquad("=", t, "1", first_quad)
 
     def untilcase_stat(self):
         self._eat("UNTILCASE")
@@ -926,6 +1247,10 @@ def main(argv):
         parser.ic.write_int_file(base + ".int")
         parser.symtab.write_symb_file(base + ".symb")
         print("PHASE 2 OK (Intermediate code + Symbol table generated)")
+        final_code = FinalCode(parser.ic, parser.symtab)
+        final_code.generate()
+        final_code.write_asm_file(base + ".asm")
+        print("PHASE 3 OK (Final RISC-V code generated)")
         return 0
     except (LexError, SynError) as e:
         print(str(e))
