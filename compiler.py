@@ -8,11 +8,10 @@ Username: cs215397
 """
 
 from dataclasses import dataclass
-from fileinput import filename
 import sys
-from tkinter.font import names
 
 
+# lektiki monada pou epistrefi o lektikos analitis 
 @dataclass
 class Token:
     type: str
@@ -25,6 +24,7 @@ class LexError(Exception):
     pass
 
 
+# tokens pou epistrefi o lektikos analitis apo ton kathe xaraktira.
 class Lexer:
     KEYWORDS = {
         "program": "PROGRAM",
@@ -103,6 +103,7 @@ class Lexer:
             col = self.col
         raise LexError(f"Lexical error at line {line}, col {col}: {msg}")
 
+    # kani skip comments kai spaces
     def _skip_ws_and_comments(self):
         while True:
             while self._peek() in (" ", "\t", "\r", "\n"):
@@ -139,6 +140,7 @@ class Lexer:
             break
 
     def next_token(self) -> Token:
+        # skip kena kai sxolia prin ksekinisisoume na anagnorizoume to epomeno token.
         self._skip_ws_and_comments()
 
         start_line, start_col = self.line, self.col
@@ -151,6 +153,7 @@ class Lexer:
             self._advance()
             return Token("SEMI", ch, start_line, start_col)
 
+        # elegxos 2 xaraktiron
         two = ch + self._peek(1)
         if two in self.TWO_OPS:
             self._advance()
@@ -175,6 +178,7 @@ class Lexer:
             self._advance()
             return Token(self.SINGLE[ch], ch, start_line, start_col)
 
+        # anagnorisi id kai keywords
         if ch.isalpha():
             buf = []
             while True:
@@ -189,6 +193,7 @@ class Lexer:
                 lex = lex[:30]
             return Token(tok_type, lex, start_line, start_col)
 
+        # anagnorisi arithmou
         if ch.isdigit() or (ch in "+-" and self._peek(1).isdigit()):
             sign = ""
             if ch in "+-":
@@ -217,6 +222,7 @@ class Lexer:
 class SynError(Exception):
     pass
 
+# tetrada endiamesou.
 @dataclass
 class Quad:
     label: int
@@ -226,19 +232,23 @@ class Quad:
     z: str
 
 
+# dixirisi tetradon kai voithitikon liston gia backpatching.
 class IntermediateCode:
     def __init__(self):
-        self.quads = []
-        self.temp_counter = 0
+        self.quads = [] #lista tetradon
+        self.temp_counter = 0 #prosorines metavlites T_1, T_2, ...
 
+    # arithmos epomenis
     def nextquad(self):
         return len(self.quads) + 1
 
+    # create quad
     def genquad(self, op, x="_", y="_", z="_"):
         q = Quad(self.nextquad(), op, str(x), str(y), str(z))
         self.quads.append(q)
         return q.label
 
+    # dimiourgi temp metavlites T_1, T_2
     def newtemp(self):
         self.temp_counter += 1
         return f"T_{self.temp_counter}"
@@ -252,6 +262,7 @@ class IntermediateCode:
     def mergelist(self, l1, l2):
         return l1 + l2
 
+
     def backpatch(self, lst, z):
         for label in lst:
             for q in self.quads:
@@ -264,15 +275,17 @@ class IntermediateCode:
             for q in self.quads:
                 f.write(f"{q.label}: {q.op}, {q.x}, {q.y}, {q.z}\n")
                 
+# Every Entity einai mia egrafi sto sym table
 @dataclass
 class Entity:
     name: str
-    kind: str
-    mode: str = ""
+    kind: str # variable, parameter, function, temp
+    mode: str = "" # cv or ref
     scope_level: int = 0
-    offset: int = 0
+    offset: int = 0 #position sti stiva
 
 
+# every scope kratai ta entity enos epipedou 
 class Scope:
     def __init__(self, level):
         self.level = level
@@ -288,6 +301,7 @@ class Scope:
         self.entities.append(entity)
 
 
+# symb table kratai scope vars params functions kai temps
 class SymbolTable:
     def __init__(self):
         self.scopes = []
@@ -394,17 +408,18 @@ class SymbolTable:
                 f.write(self.format_scope(scope))
                 f.write("\n\n")
 
+# final code for RISC-V apo tis tetrades.
 class FinalCode:
     def __init__(self, intermediate_code: IntermediateCode, symbol_table: SymbolTable):
         self.ic = intermediate_code
         self.symtab = symbol_table
         self.asm = []
 
-        # Κρατάμε προσωρινά τις παραμέτρους που εμφανίζονται πριν από ένα call.
+        # Kratame prosorina tis parametrous pou emfanizontai prin apo ena call.
         self.pending_params = []
         self.pending_ret = None
 
-        # Εδώ κρατάμε σε ποιο scope ανήκει κάθε block/function.
+        # Edo kratame se poio scope anikei kathe block/function.
         self.block_scopes = {}
         self.current_scope = None
 
@@ -413,21 +428,8 @@ class FinalCode:
         return value.isdigit() or (value.startswith("-") and value[1:].isdigit())
     
     def prepare_block_scopes(self):
-        """
-        Συνδέει κάθε begin_block με ένα scope από το completed_scopes.
-
-        Επειδή τα scopes ολοκληρώνονται με σειρά:
-        - πρώτα οι functions
-        - μετά το main program
-
-        και τα begin_block στον ενδιάμεσο κώδικα βγαίνουν με την ίδια σειρά,
-        μπορούμε να τα αντιστοιχίσουμε απλά ένα προς ένα.
-        """
-        block_names = []
-
-        for q in self.ic.quads:
-            if q.op == "begin_block":
-                block_names.append(q.x)
+        # Syndeoume kathe begin_block me to antistoixo scope tou symb table.
+        block_names = [q.x for q in self.ic.quads if q.op == "begin_block"]
 
         for name, scope in zip(block_names, self.symtab.completed_scopes):
             self.block_scopes[name] = scope
@@ -439,10 +441,7 @@ class FinalCode:
         return begin_blocks[-1]
 
     def find_entity(self, name):
-        """
-        Ψάχνει πρώτα στο τρέχον scope και μετά σε όλα τα υπόλοιπα.
-        Για την απλή έκδοση αυτό αρκεί.
-        """
+        # Psaxnoume prwta sto current scope kai meta sta olokliromena scopes.
         if self.current_scope is not None:
             for entity in self.current_scope.entities:
                 if entity.name == name:
@@ -475,10 +474,7 @@ class FinalCode:
             self.asm.append(f"    lw {register}, {entity.offset}(sp)")
         
     def load_address(self, variable, register):
-        """
-        Φορτώνει τη διεύθυνση μίας μεταβλητής σε register.
-        Χρειάζεται για inout / REF παραμέτρους.
-        """
+        # Fortonoume ti dieuthinsi mias metavlitis gia inout / REF params
         variable = str(variable)
         entity = self.find_entity(variable)
 
@@ -515,16 +511,8 @@ class FinalCode:
         self.asm.append(".globl main")
         self.asm.append("main:")
 
-        # Πηδάμε στην αρχή του main program, γιατί οι functions εμφανίζονται πρώτες.
-        main_name = None
-        for q in self.ic.quads:
-            if q.op == "halt":
-                # το main begin_block είναι το τελευταίο begin_block πριν το halt
-                break
-
-        begin_blocks = [q.x for q in self.ic.quads if q.op == "begin_block"]
-        if begin_blocks:
-            main_name = begin_blocks[-1]
+        # Pidame stin arxi tou main program, giati oi functions emfanizontai protes
+        main_name = self.get_main_block_name()
 
         if main_name is not None:
             self.asm.append(f"    j L_block_{main_name}")
@@ -614,7 +602,7 @@ class FinalCode:
         elif op == "call":
             func_name = q.x
 
-            # 1. Φορτώνουμε τις actual παραμέτρους ΠΡΙΝ αλλάξουμε stack frame.
+            # 1. fortonoume actual params prin allaxoume stack frame
             for index, (param_value, param_mode) in enumerate(self.pending_params):
                 target_register = f"a{index + 1}"
 
@@ -623,18 +611,18 @@ class FinalCode:
                 else:
                     self.loadvr(param_value, target_register)
 
-            # 2. Φτιάχνουμε νέο frame για την function.
+            # 2. Ftiahnoume neo frame gia tin function
             self.asm.append("    addi sp, sp, -256")
             self.asm.append("    sw ra, 0(sp)")
 
-            # 3. Κλήση function.
+            # 3. Klisi function.
             self.asm.append(f"    jal L_block_{func_name}")
 
-            # 4. Επιστροφή στο προηγούμενο frame.
+            # 4. Epistrofi sto proigoumeno frame.
             self.asm.append("    lw ra, 0(sp)")
             self.asm.append("    addi sp, sp, 256")
 
-            # 5. Αν υπάρχει return temp, αποθηκεύουμε το a0 στο caller frame.
+            # 5. An yparxei return temp, apothikevoume to a0 sto caller frame.
             if self.pending_ret is not None:
                 self.storerv("a0", self.pending_ret)
 
@@ -651,11 +639,7 @@ class FinalCode:
         self.asm.append("")
         
     def store_formal_parameters(self):
-        """
-        Τα actual params έχουν έρθει στους a1, a2, ...
-        Για CV κρατάμε τιμή.
-        Για REF κρατάμε διεύθυνση.
-        """
+        # Ta actual params exoun erthei stous a1, a2, ... kai apothikeuontai sto frame.
         if self.current_scope is None:
             return
 
@@ -671,10 +655,11 @@ class FinalCode:
             for line in self.asm:
                 f.write(line + "\n")
                 
+# Syntaktikos analytis anadromikis katabasis.
 class Parser:
     def __init__(self, lexer: Lexer):
-        self.lexer = lexer
-        self.lookahead = self.lexer.next_token()
+        self.lexer = lexer  # token apo to lexer
+        self.lookahead = self.lexer.next_token() #current token on parser
         self.ic = IntermediateCode()
         self.symtab = SymbolTable()
 
@@ -699,6 +684,7 @@ class Parser:
             f"Syntax error at line {t.line}, col {t.col}: {msg} (found {t.type} '{t.lexeme}')"
         )
 
+    # an ine to provlepomeno token continue allios error
     def _eat(self, token_type: str):
         if self.lookahead.type == token_type:
             self.lookahead = self.lexer.next_token()
@@ -720,8 +706,9 @@ class Parser:
         prog_name = self.lookahead.lexeme
         self._eat("ID")
         self.programblock(prog_name, is_main=True)
-
+    
     def programblock(self, name=None, is_main=False):
+        # Kathe program/function block = neo scope ston pinaka symvolon.
         self.symtab.enter_scope()
 
         if hasattr(self, "formalpars_buffer") and self.formalpars_buffer:
@@ -748,6 +735,7 @@ class Parser:
 
         self.symtab.exit_scope()
 
+    # oso iparxi ; sinexizoume allios stamatame
     def statements_sequence(self):
         if self._starts_statement(self.lookahead.type):
             self.statement()
@@ -757,13 +745,15 @@ class Parser:
                     self.statement()
                 else:
                     break
-
+    
+    # anathesis
     def declarations(self):
         while self.lookahead.type == "DECLARE":
             self._eat("DECLARE")
             self.varlist()
             self._eat("SEMI")
-
+            
+    # diavazi ta ids
     def varlist(self):
         if self.lookahead.type == "ID":
             name = self.lookahead.lexeme
@@ -778,10 +768,12 @@ class Parser:
                 self.symtab.add_variable(name)
                 self._eat("ID")
 
+    # anagnorizi funtions
     def functions(self):
         while self.lookahead.type == "FUNCTION":
             self.function()
 
+    # diavazi function name, formal parameters kai to block tis function
     def function(self):
         self._eat("FUNCTION")
         if self.lookahead.type != "ID":
@@ -836,6 +828,7 @@ class Parser:
         else:
             self.statement()
 
+    # apofasizi type tis entolis
     def statement(self):
         if self.lookahead.type == "ID":
             self.id_started_statement()
@@ -1066,13 +1059,6 @@ class Parser:
         self.ic.genquad("call", func_name, "_", "_")
         return ret_temp
 
-    def actualparlist(self):
-        if self.lookahead.type in ("IN", "INOUT"):
-            self.actualparitem()
-            while self.lookahead.type == "COMMA":
-                self._eat("COMMA")
-                self.actualparitem()
-
     def actualparitem(self):
         if self.lookahead.type == "IN":
             self._eat("IN")
@@ -1091,6 +1077,7 @@ class Parser:
             self._error("Expected actual parameter item")
 
     def condition(self):
+        # ta condition epistrefoun bool listes pou simplirononte sto backpathing
         true_list, false_list = self.boolterm()
 
         while self.lookahead.type == "OR":
@@ -1160,6 +1147,7 @@ class Parser:
             self._error("Expected relational operator")
 
     def expression(self):
+        # ipologizoume praksis kai ftiaxnoume prosorines tetrades
         sign = None
         if self.lookahead.type in ("PLUS", "MINUS"):
             sign = self.lookahead.type
